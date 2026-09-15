@@ -1,0 +1,11 @@
+[project]
+name = "manymail_for_claudechat"
+version = "0.1.0"
+description = "Multi-account Gmail MCP server for Claude Desktop / Claude Code"
+requires-python = ">=3.12"
+dependencies = [
+    "mcp>=2",
+    "google-api-python-client>=2.100",
+    "google-auth-oauthlib>=1.2",
+    "google-auth-httplib2>=0.2",
+]
