@@ -1,57 +1,93 @@
 # manymail_for_claudechat
 
-Claude Desktop / Claude Code에서 **여러 Gmail 계정**을 이름으로 골라 쓰는 로컬 MCP 서버.
+*English · [한국어](README_KOR.md)*
 
-계정마다 OAuth 토큰을 `tokens/<이름>.json`에 따로 저장해 두고, 모든 도구가 `account` 인자로
-어느 메일함을 쓸지 고른다. claude.ai에 내장된 Gmail 커넥터와는 완전히 별개로 동작하므로
-둘을 동시에 켜 두고 계정별로 나눠 쓸 수 있다.
+A local [MCP](https://modelcontextprotocol.io) server that gives Claude Desktop, Claude Code and the
+ChatGPT desktop app access to **any number of Gmail accounts**, picked by name.
+
+Each mailbox gets its own OAuth token under `tokens/<name>.json`, and every tool takes an `account`
+argument to say which one to use. It runs entirely on your machine and is independent of the built-in
+Gmail connector in claude.ai, so you can keep both and split accounts between them.
 
 ```
-"지메일에서 어제 온 메일 정리해줘"   → search_messages(account="gmail", query="newer_than:1d")
-"모든 계정에서 인보이스 찾아줘"      → search_messages(account="all", query="subject:invoice")
+"clean up yesterday's mail in my gmail"  → search_messages(account="gmail", query="newer_than:1d")
+"find that invoice in any account"       → search_messages(account="all", query="subject:invoice")
+"reply to the last one, attach q3.pdf"   → create_draft(reply_to_message_id=..., attachments=["q3.pdf"])
 ```
 
-## 구성
+## Contents
 
-| 파일 | 역할 |
+| File | Role |
 |---|---|
-| [server.py](server.py) | MCP 서버 본체 (stdio). 도구 9개 정의 |
-| [auth.py](auth.py) | 계정 1개를 OAuth 인증해 `tokens/<이름>.json` 생성 |
-| [gmail_common.py](gmail_common.py) | 경로·스코프·토큰 로딩/갱신 공용 코드 |
-| `credentials.json` | Google Cloud OAuth 클라이언트(데스크톱 앱). **직접 받아서 넣어야 함** |
-| `tokens/<이름>.json` | 계정별 액세스/리프레시 토큰 (`chmod 600`, git 제외) |
+| [server.py](server.py) | The MCP server (stdio). Defines 11 tools |
+| [auth.py](auth.py) | Authorizes one account, writes `tokens/<name>.json` |
+| [gmail_common.py](gmail_common.py) | Shared paths, scopes, token loading and refresh |
+| `credentials.json` | Your OAuth client (Desktop app) from Google Cloud Console — **you supply this** |
+| `credentials-<name>.json` | Optional per-account OAuth client; used in preference to the above |
+| `tokens/<name>.json` | Per-account access and refresh tokens (`chmod 600`, git-ignored) |
 
-요구 사항: Python 3.12+, [uv](https://docs.astral.sh/uv/), `mcp>=2` (현재 2.2.0), google-api-python-client.
+Requires Python 3.12+, [uv](https://docs.astral.sh/uv/), `mcp>=2` (built against 2.2.0) and
+google-api-python-client.
 
-## 1. Google Cloud 설정 (1회)
+## 1. Google Cloud setup (once)
 
-1. <https://console.cloud.google.com> → 새 프로젝트 (예: `gmail-claude`)
-2. **API 및 서비스 → 라이브러리** → `Gmail API` → 사용 설정
-3. **OAuth 동의 화면** (새 UI에서는 *Google Auth Platform*)
-   - 사용자 유형 **외부**, 앱 이름·이메일만 채우고 저장
-   - 범위(Data Access): `https://www.googleapis.com/auth/gmail.modify` 추가
-   - 테스트 사용자(Audience): **연결할 모든 Gmail 주소**를 등록 (등록 안 된 계정은 로그인이 거부된다)
-4. **사용자 인증 정보 만들기 → OAuth 클라이언트 ID** → 유형 **데스크톱 앱**
-5. JSON 다운로드 → 이 폴더에 `credentials.json`으로 저장
+1. <https://console.cloud.google.com> → create a project
+2. **APIs & Services → Library** → `Gmail API` → Enable
+3. **Google Auth Platform** (formerly *OAuth consent screen*) → **Branding**: fill in app name,
+   user support email and developer contact email, then save
+4. **Data Access** → add `https://www.googleapis.com/auth/gmail.modify`
+5. **Audience** → check your user type (see below)
+6. **Clients → Create client** → type **Desktop app** → download the JSON → save it in this folder
+   as `credentials.json`
 
-> 동의 화면이 "테스트" 상태면 리프레시 토큰이 **7일**마다 만료된다. 계속 쓸 거면
-> 동의 화면에서 **앱 게시(프로덕션)** 를 눌러 둘 것 (심사 불필요).
+### Internal vs External — read this before you get stuck
 
-## 2. 설치 & 계정 인증
+**Your user type is decided by who owns the project**, and it changes everything downstream.
+
+| | Internal | External |
+|---|---|---|
+| Requires | Project owned by a Workspace organization | Any personal Google account |
+| Who can sign in | Members of that organization only | Anyone, subject to the row below |
+| Test users | Not applicable | Required while status is "Testing" |
+| Refresh token lifetime | Unlimited | **7 days** in Testing, unlimited in Production |
+| "Unverified app" warning | None | Shown until the app is verified |
+
+So a school or work address is cleanest as an **Internal** app inside that organization's project,
+while a personal Gmail address can only ever use an **External** app — a personal account belongs to
+no organization, so it cannot sign in to an Internal app at all.
+
+A project has exactly **one** consent screen, so it cannot be Internal and External at the same time.
+If you need both, create **two projects** and keep their clients apart as
+`credentials-<name>.json`.
+
+> **To stop re-authorizing every 7 days**, publish the External app to production. Publishing
+> requires a homepage URL and a privacy policy URL in Branding — links to a public repository are
+> accepted — plus the bare host (e.g. `github.com`) under **Authorized domains**. `gmail.modify` is a
+> restricted scope, so Google will mention verification; personal use works unverified, capped at
+> 100 users.
+
+## 2. Install and authorize
 
 ```bash
-cd /Users/sj/manymail_for_claudechat
+git clone https://github.com/sg20180546/manymail_for_claudechat
+cd manymail_for_claudechat
 uv sync
-uv run auth.py gmail        # 브라우저가 열림 → 계정 선택 → 허용
+uv run auth.py gmail        # opens a browser → pick the account → allow
 ```
 
-- 계정 이름은 자유(파이썬 식별자면 됨): `gmail`, `work`, `asu`, `gmail2` …
-  이름 하나 = 메일함 하나 = `tokens/<이름>.json` 하나. 계정을 더 붙이려면 이름만 바꿔 다시 실행한다.
-- "Google에서 확인하지 않은 앱" 화면이 뜨면 **고급 → (앱 이름)(으)로 이동**.
-- 성공하면 `OK: account 'gmail' -> you@example.com` 이 출력되고 토큰 파일이 생긴다.
-- 서버는 `credentials.json`이 아니라 `tokens/*.json`만 읽는다. 토큰이 있는 계정이 곧 사용 가능한 계정.
+- The account name is a local label, any valid identifier: `gmail`, `work`, `asu`, `personal` …
+  One name = one mailbox = one `tokens/<name>.json`. Run it again with a different name to add
+  another account.
+- On the "Google hasn't verified this app" screen, choose **Advanced → Go to (app name)**.
+- On success it prints `OK: account 'gmail' -> you@example.com`.
+- The server reads `tokens/*.json`, never `credentials.json`. Whichever accounts have a token are the
+  accounts that exist.
+- To authorize an account through a different Cloud project, save that project's client as
+  `credentials-<name>.json`.
 
-## 3. 클라이언트에 등록
+## 3. Register with a client
+
+Replace `/absolute/path/to/manymail_for_claudechat` below with your actual path.
 
 **Claude Desktop** — `~/Library/Application Support/Claude/claude_desktop_config.json`
 (Settings → Developer → Edit Config):
@@ -61,133 +97,172 @@ uv run auth.py gmail        # 브라우저가 열림 → 계정 선택 → 허�
   "mcpServers": {
     "manymail_for_claudechat": {
       "command": "/opt/homebrew/bin/uv",
-      "args": ["run", "--directory", "/Users/sj/manymail_for_claudechat", "server.py"],
+      "args": ["run", "--directory", "/absolute/path/to/manymail_for_claudechat", "server.py"],
       "env": { "GMAIL_DEFAULT_ACCOUNT": "gmail" }
     }
   }
 }
 ```
 
-`env`는 생략 가능(→ 아래 [계정 선택 규칙](#계정-선택-규칙) 참고). 등록 후 Claude Desktop을 완전히 종료(⌘Q)했다가 다시 연다.
+`env` is optional — see [account selection](#account-selection). Quit Claude Desktop completely (⌘Q)
+and reopen it.
 
-**Claude Code** — `claude`가 PATH에 없으면 VS Code 확장에 번들된 바이너리를 쓴다:
+**Claude Code**
 
 ```bash
-CLAUDE=$(ls -d ~/.vscode/extensions/anthropic.claude-code-*/resources/native-binary/claude | tail -1)
-"$CLAUDE" mcp add --scope user manymail_for_claudechat -- \
-  /opt/homebrew/bin/uv run --directory /Users/sj/manymail_for_claudechat server.py
+claude mcp add --scope user manymail_for_claudechat -- \
+  /opt/homebrew/bin/uv run --directory /absolute/path/to/manymail_for_claudechat server.py
 ```
 
-**ChatGPT 데스크탑 (macOS)** — Codex 호스트와 MCP 설정(`~/.codex/config.toml`)을 공유하므로
-stdio 서버를 그대로 쓴다. 앱 UI는 Settings → MCP servers → Add server → STDIO,
-CLI로 하려면 번들된 codex 바이너리를 쓴다:
+**ChatGPT desktop (macOS)** shares its MCP configuration (`~/.codex/config.toml`) with the Codex host,
+so it runs stdio servers directly. Use Settings → MCP servers → Add server → STDIO, or the bundled
+binary:
 
 ```bash
 CODEX=/Applications/ChatGPT.app/Contents/Resources/codex
 "$CODEX" mcp add manymail_for_claudechat -- \
-  /opt/homebrew/bin/uv run --directory /Users/sj/manymail_for_claudechat server.py
-"$CODEX" mcp list          # 등록 확인
+  /opt/homebrew/bin/uv run --directory /absolute/path/to/manymail_for_claudechat server.py
+"$CODEX" mcp list
 ```
 
-등록 후 ChatGPT 데스크탑을 재시작하면 대화창에서 `/mcp`로 연결 상태를 볼 수 있다.
-웹 ChatGPT(Connectors/개발자 모드)는 공개 HTTPS 엔드포인트만 받으므로 이 stdio 서버를
-그대로 쓸 수 없다 — `mcp.run(transport="streamable-http")`로 바꾸고 배포 + 인증을 붙여야 한다.
+Restart ChatGPT desktop, then `/mcp` in the composer shows the connection.
 
-## 4. 도구
+**ChatGPT on the web is not supported.** Connectors run in OpenAI's cloud and only accept a public
+HTTPS endpoint, so this stdio server cannot be used as-is — you would need
+`mcp.run(transport="streamable-http")`, a deployment, and an authentication layer in front of it.
 
-| 도구 | 설명 |
+## 4. Tools
+
+| Tool | Description |
 |---|---|
-| `list_accounts()` | 등록된 계정 이름 ↔ 실제 이메일 주소. 인증이 깨진 계정은 해당 줄에 에러 문자열이 담긴다 |
-| `search_messages(query, account?, max_results=20)` | Gmail 검색 문법 그대로 (`from:`, `newer_than:7d`, `is:unread`, `has:attachment`). 요약 목록 반환, 최대 100 |
-| `get_message(message_id, account?)` | 헤더 + 본문 텍스트 + 첨부 메타데이터 |
-| `get_thread(thread_id, account?)` | 스레드의 모든 메시지를 오래된 순으로 |
-| `create_draft(to[], body, subject?, account?, cc?, bcc?, reply_to_message_id?, attachments?, inline_attachments?)` | 초안 작성 (발송 안 함) |
-| `send_message(to[], body, subject?, …)` | 즉시 발송 (인자는 `create_draft`와 동일) |
-| `send_draft(draft_id, account?)` | 기존 초안 발송 |
-| `list_attachable_files()` | 첨부 가능한 파일 목록 (허용 폴더 안만) |
-| `download_attachment(message_id, attachment, account?)` | 받은 첨부를 디스크에 저장하고 경로 반환 |
-| `list_labels(account?)` | 라벨 id/이름 |
-| `modify_labels(message_id, add?, remove?, account?)` | 라벨 추가/제거 |
+| `list_accounts()` | Configured account names and the address each resolves to. An account whose auth is broken reports the error in its own row |
+| `search_messages(query, account?, max_results=20, include_spam=False)` | Gmail search syntax (`from:`, `newer_than:7d`, `is:unread`, `has:attachment`). Returns summaries, capped at 100 |
+| `get_message(message_id, account?, include_spam=False)` | Headers, body text, attachment metadata |
+| `get_thread(thread_id, account?, include_spam=False)` | Every message in a thread, oldest first |
+| `create_draft(to[], body, subject?, account?, cc?, bcc?, reply_to_message_id?, attachments?, inline_attachments?)` | Create a draft; nothing is sent |
+| `send_message(to[], body, subject?, …)` | Send immediately; same arguments as `create_draft` |
+| `send_draft(draft_id, account?)` | Send an existing draft |
+| `list_attachable_files()` | Files that may be attached (allowlisted folders only) |
+| `download_attachment(message_id, attachment, account?)` | Save a received attachment and return its path |
+| `list_labels(account?)` | Label ids and names |
+| `modify_labels(message_id, add?, remove?, account?)` | Add or remove labels |
 
-동작 디테일:
+Behaviour worth knowing:
 
-- **답장 스레딩** — `create_draft` / `send_message`에 `reply_to_message_id`를 주면 원본의
-  `Message-ID`/`References`를 붙이고 같은 `threadId`에 넣는다. `subject`가 비어 있으면
-  `Re: <원본 제목>`이 자동으로 채워진다 (이미 `Re:`면 그대로).
-- **본문 추출** — `text/plain`을 우선 쓰고, 없으면 HTML에서 `script`/`style`을 버리고 텍스트만 뽑는다.
-- **라벨 조작** — 시스템 id는 `UNREAD`, `INBOX`, `STARRED`, `IMPORTANT`, `TRASH`, `SPAM`.
-  `remove=["UNREAD"]` 읽음 처리, `remove=["INBOX"]` 보관, `add=["TRASH"]` 휴지통.
-- **읽기 전용 표시** — `list_accounts`, `search_messages`, `get_message`, `get_thread`,
-  `list_labels`는 read-only로 선언되어 있어 클라이언트가 승인 UI를 다르게 처리할 수 있다.
+- **Reply threading** — pass `reply_to_message_id` and the draft inherits the original's `Message-ID`
+  and `References` and lands in the same `threadId`. An empty `subject` becomes
+  `Re: <original subject>`.
+- **Body extraction** — prefers `text/plain`; otherwise strips `script`/`style` out of the HTML part
+  and returns the text.
+- **Labels** — system ids are `UNREAD`, `INBOX`, `STARRED`, `IMPORTANT`, `TRASH`, `SPAM`.
+  `remove=["UNREAD"]` marks read, `remove=["INBOX"]` archives, `add=["TRASH"]` trashes.
+- **Read-only hints** — `list_accounts`, `search_messages`, `get_message`, `get_thread`,
+  `list_attachable_files` and `list_labels` are annotated read-only so clients can treat their
+  approval prompts differently.
 
-현재 지원하지 않는 것: HTML 본문으로 발송(평문만), 영구 삭제(스코프가 `gmail.modify`라 휴지통까지만).
+Not supported: sending HTML bodies (plain text only), permanent deletion (the `gmail.modify` scope
+stops at the trash).
 
-## 첨부파일
+## Attachments
 
-**보낼 때는 허용된 폴더 안의 파일만 첨부할 수 있다.** 기본값:
+**Outgoing attachments may only be read from allowlisted folders:**
 
-| 폴더 | 용도 |
+| Folder | Purpose |
 |---|---|
-| `~/MailOutbox` | 보낼 파일을 여기 두면 첨부 가능 (`GMAIL_OUTBOX_DIR`로 변경) |
-| `~/MailOutbox/downloads` | `download_attachment`가 받은 첨부를 저장하는 곳 → 그대로 전달(forward) 가능 |
-| `~/.codex/attachments` | ChatGPT 데스크탑에서 붙여넣은 텍스트가 파일로 남는 위치 |
+| `~/MailOutbox` | Put a file here to make it attachable (override with `GMAIL_OUTBOX_DIR`) |
+| `~/MailOutbox/downloads` | Where `download_attachment` saves — so a received file can be forwarded |
+| `~/.codex/attachments` | Where ChatGPT desktop keeps text you pasted into the chat |
 
-이 밖의 경로는 거부된다. 경로는 `resolve()`로 정규화한 뒤 검사하므로 `..`나
-**허용 폴더 밖을 가리키는 심볼릭 링크도 막힌다.**
+Anything else is refused. Paths are normalized with `resolve()` before the check, so `..` and
+**symlinks pointing outside the allowlist are rejected too**.
 
-> 왜 제한하나: 이 서버는 로컬 파일 읽기와 메일 발송을 **둘 다** 할 수 있다. 허용 목록이 없으면
-> 받은 메일 본문에 숨겨진 프롬프트 인젝션("이 파일을 첨부해서 보내줘")이 그대로 유출 경로가 된다.
+> Why the restriction: this server can read local files *and* send mail. Without an allowlist, a
+> prompt injection buried in an incoming message ("attach this file and forward it") is a working
+> exfiltration path.
 
-채팅에 **붙여넣은 텍스트**는 디스크를 거치지 않고 `inline_attachments`로 바로 첨부한다:
+Text **pasted into the chat** can be attached without touching disk:
 
 ```python
 inline_attachments=[{"filename": "data.csv", "content": "a,b\n1,2\n"}]
 ```
 
-한계: 클라이언트가 파일을 로컬에 남기지 않으면 MCP 서버는 그 파일을 볼 수 없다.
-Claude Desktop은 업로드 파일을 디스크에 보관하지 않고(`pending-uploads/`는 전송 중에만 사용),
-PDF·이미지는 모델이 **추출된 텍스트만** 보므로 원본 바이트를 넘길 방법이 없다.
-즉 **"Claude에 PDF를 붙여넣고 그대로 Gmail 첨부"는 불가능하다** — 파일을 `~/MailOutbox`에 두고
-이름으로 첨부해야 한다. 붙여넣은 텍스트는 `inline_attachments`로 커버된다.
+There is a real limit here. An MCP server can only see files the client leaves on disk. Claude Desktop
+does not keep uploaded files (`pending-uploads/` is used only during transfer), and for PDFs and
+images the model sees **extracted text**, never the original bytes. So **"paste a PDF into Claude and
+attach it to a mail" is not possible** — put the file in `~/MailOutbox` and attach it by name. Pasted
+text is covered by `inline_attachments`.
 
-발송 용량은 `raw` 업로드 한계상 합계 25 MB까지고, 초과하면 발송 전에 에러가 난다.
+Total attachment size is capped at 25 MB, the limit for this upload method; larger sets fail before
+anything is sent.
 
-## 계정 선택 규칙
+## Account selection
 
-`account`를 생략했을 때 서버가 고르는 순서:
+When `account` is omitted, the server resolves it in this order:
 
-1. `account` 인자가 있으면 그 계정 (없는 이름이면 사용 가능 목록과 함께 에러)
-2. 환경변수 `GMAIL_DEFAULT_ACCOUNT` 가 등록된 계정이면 그 계정
-3. 등록된 계정이 **하나뿐**이면 그 계정
-4. 그 외 → "계정을 명시하라"는 에러
+1. An explicit `account` argument (an unknown name errors with the list of valid ones)
+2. `GMAIL_DEFAULT_ACCOUNT`, if it names a configured account
+3. The only configured account, if there is exactly one
+4. Otherwise an error asking for an explicit account
 
-`account="all"`은 **`search_messages`에서만** 쓸 수 있다. 모든 계정을 각각 검색해
-결과를 이어 붙이므로 `max_results`는 계정당 적용되고, 정렬은 계정 단위 → 계정 내 최신순이다.
-메시지/스레드/초안 id는 **발급된 계정 안에서만 유효**하다. 다른 계정에 그대로 넘기면 404가 난다.
+`account="all"` works **only in `search_messages`**. It searches each account and concatenates the
+results, so `max_results` applies per account and ordering is by account, then newest first within
+each. Message, thread and draft ids are **only valid inside the account that issued them** — reusing
+one against another account returns 404.
 
-여러 계정을 쓸 때 라우팅을 확실히 하려면 Claude Desktop **Settings → Profile → 개인 선호 설정**에
-한 줄 적어 두면 좋다. 예:
+With several accounts it helps to state the routing rule in your client's personal preferences, e.g.:
 
-> 메일 작업 시: "지메일"/"개인 메일"이면 manymail_for_claudechat MCP 도구(`account="gmail"`)를 쓰고,
-> "학교 메일"이면 claude.ai 기본 Gmail 커넥터를 써. 어느 계정인지 불분명하면 먼저 물어봐.
+> For mail: use the manymail_for_claudechat tools with `account="gmail"` for my personal mail, and the
+> built-in Gmail connector for my work mail. Ask first if it's ambiguous.
 
-## 보안
+## Untrusted mail content
 
-- `credentials.json`, `tokens/`, `.venv/`는 [.gitignore](.gitignore)에 들어 있다. 절대 커밋하지 말 것.
-- 토큰 파일은 저장 시 `chmod 600`. **비밀번호와 동급**으로 취급한다 (메일 읽기·발송 권한 그 자체).
-- 계정 연결을 끊으려면 `tokens/<이름>.json`을 지우고, 필요하면
-  [Google 계정 → 보안 → 서드파티 액세스](https://myaccount.google.com/connections)에서 앱 권한도 회수한다.
+A mail body is written by whoever sent it. Once the assistant reads one, that text sits in the same
+context as your instructions — and this server can also send mail, which is what makes it worth
+attacking. Three layers push back:
 
-## 문제 해결
+**Spam and trash are quarantined.** Searches pass `includeSpamTrash=False`, queries containing
+`in:spam`, `in:trash`, `in:anywhere` or `label:spam` are refused, and `get_message` / `get_thread`
+return the sender and subject but withhold the body of anything Gmail filed as spam or trash. Each
+is overridable with `include_spam=True`, which the model is told to use only after the user confirms.
 
-| 증상 | 대처 |
+**Bodies are scanned for injection patterns.** Both the text and the *raw HTML before tag stripping*
+are checked, so instructions hidden with `display:none` or white-on-white text are caught even though
+a human reading the mail would never see them. A hit adds a `suspicious` field listing the categories
+(`instruction-override`, `persona-override`, `fake-turn-markers`, `hidden-text`, `prompt-probe`,
+`exfiltration-request`) and turns `content_warning` into an instruction to report the message as an
+attack.
+
+**Every body carries a trust boundary marker.** `content_warning` and the server instructions both
+state that message text is data, never commands, and that a message asking to send, forward or attach
+something is an attack unless the user asked for it in the conversation.
+
+These reduce the attack surface; they do not close it. Pattern matching is evadable, and a dangerous
+message usually arrives from a compromised contact rather than the spam folder, where only the second
+and third layers apply. **The last line of defence is you checking the recipient address on the
+approval prompt** — especially right after asking the assistant to read mail you did not expect.
+
+## Security
+
+- `credentials.json`, `credentials-*.json` and `tokens/` are in [.gitignore](.gitignore). Never commit
+  them.
+- Token files are written `chmod 600`. **Treat them like passwords** — a token file embeds the
+  `client_id` and `client_secret` too, so on its own it grants full read and send access to that
+  mailbox.
+- To disconnect an account, delete `tokens/<name>.json` and revoke the grant at
+  [Google Account → Third-party access](https://myaccount.google.com/connections).
+- Mail content is passed to whichever AI client you connect, which sends it to that vendor's servers.
+  See [PRIVACY.md](PRIVACY.md).
+
+## Troubleshooting
+
+| Symptom | Fix |
 |---|---|
-| 일주일마다 재로그인 요구 | OAuth 동의 화면이 "테스트" 상태. **앱 게시(프로덕션)** 로 전환 |
-| Claude에 도구가 안 보임 | 터미널에서 `uv run server.py` 직접 실행. 출력 없이 대기하면 정상(stdio), 에러가 찍히면 그게 원인 |
-| Desktop 로그 확인 | `~/Library/Logs/Claude/mcp-server-manymail_for_claudechat.log` |
-| `No token for account …` / 리프레시 실패 | `tokens/<이름>.json` 삭제 후 `uv run auth.py <이름>` 재실행 |
-| 회사/학교 Workspace 계정 인증 차단 | 관리자 정책이 미인증 앱을 막는 경우. 해당 계정은 다른 커넥터로 쓰는 편이 빠르다 |
-| `auth.py`가 usage만 출력 | 인자는 정확히 1개여야 한다. zsh에서 `uv run auth.py gmail # 메모` 처럼 주석을 붙이면 인자로 들어간다 |
+| Re-authorization demanded every week | External app still in "Testing". Publish to production, or use an Internal app if the account is in an organization |
+| Client shows no tools | Run `uv run server.py` in a terminal. Waiting silently is correct for a stdio server; an error there is your cause |
+| Claude Desktop logs | `~/Library/Logs/Claude/mcp-server-manymail_for_claudechat.log` |
+| `No token for account …` or refresh failure | Delete `tokens/<name>.json` and re-run `uv run auth.py <name>` |
+| Work/school account blocked at consent | Admin policy blocking unverified external apps. Creating an **Internal** app inside that organization's project avoids it |
+| `auth.py` only prints usage | It takes exactly one argument. In zsh, `uv run auth.py gmail # note` passes the comment as extra arguments |
 
-> stdio 서버이므로 `server.py` 프로세스에서 **stdout에 절대 출력하면 안 된다** (프로토콜이 깨진다).
-> 디버깅 출력은 stderr로.
+> This is a stdio server, so `server.py` must **never write to stdout** — it corrupts the protocol.
+> Send debug output to stderr.
